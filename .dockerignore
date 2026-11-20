@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!requirements.txt
+!pipeline.py
+!identity.py
+!clean.sql
+!session.sql
+!output.sql
