@@ -153,13 +153,29 @@ struct Event { Key person=0; Value value; };
 struct TimedEvent { Event event; int64_t ingest; };
 struct Reference { Key id; TimedEvent* record; };
 
+// Most successive rows in one hash bucket are nearby in the input order.
+struct Positions {
+    std::vector<Key> hashes;
+    std::vector<uint8_t> distances;
+    std::vector<size_t> large;
+    size_t previous=0;
+
+    void append(Key hash,size_t position) {
+        const size_t distance=position-previous;
+        hashes.push_back(hash);
+        if (distance<255) distances.push_back(uint8_t(distance));
+        else { distances.push_back(255); large.push_back(position); }
+        previous=position;
+    }
+};
+
 // Payload blocks stay in input order; pointers remain valid until all ID
 // partitions have finished choosing their earliest arrivals.
 struct EventBatch {
     static constexpr size_t block_size = 8192;
     size_t count = 0;
     std::vector<std::unique_ptr<TimedEvent[]>> blocks;
-    Bins<Reference> ids;
+    std::array<Positions,partitions> ids;
     TimedEvent* append() {
         if (count % block_size == 0) blocks.emplace_back(new TimedEvent[block_size]);
         return &blocks.back()[count++ % block_size];
@@ -174,7 +190,7 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
         if (v[0].empty()) return;
         auto ingest=timestamp(v[3]);
         if (!ingest) return;
-        Key id=keys.encode(v[0]);
+        Key hash=mix(keys.encode(v[0]));
         auto& batch=raw[worker];
         auto* row=batch.append();
         row->ingest=*ingest;
@@ -190,7 +206,8 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
         }
         // Retain the ID and arrival even if the event is invalid. An early
         // invalid event must suppress its later valid duplicates.
-        batch.ids[bucket(id)].push_back({id,row});
+        // mix is a permutation on 64-bit words. Comparing full hashes is exact.
+        batch.ids[part(hash)].append(hash,batch.count-1);
     });
     return raw;
 }
@@ -198,26 +215,48 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
 EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMap& canon) {
     parallel(partitions,threads,[&](size_t p) {
         size_t n=0;
-        for (const auto& batch:raw) n+=batch.ids[p].size();
+        for (const auto& batch:raw) n+=batch.ids[p].hashes.size();
+        if (!n) return;
         size_t words=1;
         while (words<n/4) words*=2;
         std::vector<uint64_t> seen(words),repeated(words);
-        auto fingerprint=[&](Key id) {
-            uint64_t h=mix(id)>>6;
-            return std::pair<size_t,uint64_t>{(h>>6)&(words-1),uint64_t(1)<<(h&63)};
+        auto fingerprint=[&](Key hash) {
+            return std::pair<size_t,uint64_t>{(hash>>12)&(words-1),uint64_t(1)<<((hash>>6)&63)};
         };
-        for (const auto& batch:raw) for (auto r:batch.ids[p]) {
-            auto [word,bit]=fingerprint(r.id);
+        for (const auto& batch:raw) for (auto hash:batch.ids[p].hashes) {
+            auto [word,bit]=fingerprint(hash);
             repeated[word]|=seen[word]&bit;
             seen[word]|=bit;
         }
-        std::vector<Reference> exact;
+        // Rank gives each occupied repeated bit one owner. All collisions
+        // with the original owner spill to an exact sort. A spill key can
+        // never match an owner key from a different fingerprint.
+        size_t owners=0;
+        for (size_t i=0;i<words;++i) {
+            seen[i]=owners;
+            owners+=__builtin_popcountll(repeated[i]);
+        }
+        std::vector<Reference> first(owners),exact;
         for (auto& batch:raw) {
-            for (auto r:batch.ids[p]) {
-                auto [word,bit]=fingerprint(r.id);
-                if (repeated[word]&bit) exact.push_back(r);
+            auto& ids=batch.ids[p];
+            size_t position=0,escape=0;
+            for (size_t i=0;i<ids.hashes.size();++i) {
+                const auto distance=ids.distances[i];
+                position=distance<255 ? position+distance : ids.large[escape++];
+                const auto hash=ids.hashes[i];
+                auto [word,bit]=fingerprint(hash);
+                const auto mask=repeated[word];
+                if (!(mask&bit)) continue;
+                auto* record=&batch.blocks[position/EventBatch::block_size][position%EventBatch::block_size];
+                auto& owner=first[seen[word]+__builtin_popcountll(mask&(bit-1))];
+                if (!owner.record) owner={hash,record};
+                else if (owner.id!=hash) exact.push_back({hash,record});
+                else {
+                    if (record->ingest<owner.record->ingest) std::swap(record,owner.record);
+                    record->event.value.time=Value::invalid;
+                }
             }
-            std::vector<Reference>().swap(batch.ids[p]);
+            ids=Positions{};
         }
         std::sort(exact.begin(),exact.end(),[](auto a,auto b){return a.id<b.id;});
         for (size_t i=0;i<exact.size();) {
