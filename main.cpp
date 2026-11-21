@@ -84,8 +84,55 @@ struct Catalog {
     }
 };
 
+// The low bits of a reversible hash select the bucket. Within that bucket,
+// its high bits identify the source exactly. Reusing the low bits of a slot
+// for the destination keeps four complete lookup candidates in 32 bytes.
+struct Routes {
+    struct Bucket { Key slots[4]{}; };
+    std::vector<Bucket> buckets;
+    size_t mask=0;
+    FlatMap overflow;
+    static constexpr Key tag=Key(1)<<62;
+    void build(FlatMap& source, size_t max_code,const std::vector<Key>& routes) {
+        if (!source.size()) return;
+        size_t size=2;
+        while (size<=max_code+1 || size<source.size()/2) size*=2;
+        // Heavily skewed destination partitions can make the largest route
+        // ordinal expensive to encode. Retain the original exact table there.
+        if (size/2>source.size()+128) {
+            source.change_values([&](Key ordinal){return routes[ordinal];});
+            overflow=std::move(source);
+            return;
+        }
+        mask=size-1;
+        buckets.resize(size);
+        source.visit([&](Key id,Key ordinal) {
+            Key value=routes[ordinal];
+            Key hash=mix(id);
+            for (Key& slot:buckets[hash&mask].slots) if (!slot) {
+                slot=(hash&~Key(mask))|((value^tag)+1);
+                return;
+            }
+            overflow.put(id,value);
+        });
+    }
+    void prefetch(Key hash) const {
+        if (mask) __builtin_prefetch(&buckets[hash&mask],0,1);
+        else overflow.prefetch(hash);
+    }
+    Key lookup_hashed(Key id,Key hash) const {
+        if (!mask) return overflow.lookup_hashed(id,hash);
+        const auto& cells=buckets[hash&mask].slots;
+        auto hi=hash&~Key(mask);
+        for (auto word:cells) {
+            if (!word) return 0;
+            if ((word&~Key(mask))==hi) return tag|((word&mask)-1);
+        }
+        return overflow.lookup_hashed(id,hash);
+    }
+};
 struct Identities {
-    FlatMap routes;
+    Routes routes;
     Bins<Key> names;
     // Packed text uses at most 60 bits. Interned keys always have bit 63 set.
     // The remaining 01 prefix can therefore carry a dense group ordinal.
@@ -117,22 +164,47 @@ Identities identities(const fs::path& dir,size_t threads,Keys& keys) {
         while (parent[i]!=i) { parent[i]=parent[parent[i]]; i=parent[i]; }
         return i;
     };
-    auto add=[&](Key k) -> Index {
+    auto add=[&](Key k,Key hash) -> Index {
         Index next=parent.size();
-        Index i=index.insert_or_get(k,next);
+        Index i=index.insert_or_get_hashed(k,next,hash);
         if (i==next) {
             parent.push_back(i);
             sizes.push_back(1);
             names.push_back(k);
         }
-        return find(i);
+        return i;
     };
-    for (auto &batch:edges) for (auto [left,right]:batch) {
-        Index a=add(left), b=add(right);
-        if (a==b) continue;
-        if (sizes[a]<sizes[b]) std::swap(a,b);
-        parent[b]=a; sizes[a]+=sizes[b];
-        if (keys.less(names[b],names[a])) names[a]=names[b];
+    // Probe endpoint IDs in batches before following union-find parents.
+    // Processing the edges themselves in input order preserves every merge.
+    constexpr size_t width=64;
+    for (const auto& batch:edges) for (size_t begin=0;begin<batch.size();begin+=width) {
+        size_t count=std::min(width,batch.size()-begin);
+        std::pair<Key,Key> hashes[width];
+        std::pair<Index,Index> endpoints[width];
+        for (size_t j=0;j<count;++j) {
+            auto [a,b]=batch[begin+j];
+            hashes[j]={mix(a),mix(b)};
+            index.prefetch(hashes[j].first);
+            index.prefetch(hashes[j].second);
+        }
+        for (size_t j=0;j<count;++j) {
+            auto [a,b]=batch[begin+j];
+            endpoints[j]={add(a,hashes[j].first),add(b,hashes[j].second)};
+            __builtin_prefetch(parent.data()+endpoints[j].first);
+            __builtin_prefetch(parent.data()+endpoints[j].second);
+        }
+        for (size_t j=0;j<count;++j) {
+            auto [a,b]=endpoints[j];
+            a=find(a); b=find(b);
+            if (a==b) continue;
+            if (sizes[a]<sizes[b]) std::swap(a,b);
+            parent[b]=a; sizes[a]+=sizes[b];
+        }
+    }
+    for (size_t i=0;i<parent.size();++i) {
+        Index root=find(i);
+        parent[i]=root;
+        if (keys.less(names[i],names[root])) names[root]=names[i];
     }
     Identities result;
     for (size_t i=0;i<parent.size();++i) if (parent[i]==i) {
@@ -141,8 +213,11 @@ Identities identities(const fs::path& dir,size_t threads,Keys& keys) {
         names[i]=Identities::tag | (result.names[bin].size()*partitions+bin);
         result.names[bin].push_back(name);
     }
-    index.change_values([&](Key i){return names[find(i)];});
-    result.routes=std::move(index);
+    for (size_t i=0;i<parent.size();++i) names[i]=names[parent[i]];
+    size_t max_code=0;
+    for (size_t p=0;p<partitions;++p) if (!result.names[p].empty())
+        max_code=std::max(max_code,(result.names[p].size()-1)*partitions+p);
+    result.routes.build(index,max_code,names);
     return result;
 }
 
@@ -654,7 +729,7 @@ void run(const fs::path& input,const fs::path& output,size_t threads,Keys& keys,
     auto events=deduplicate(raw,threads,canon);
     progress("event deduplication");
     auto clicks=read_clicks(input/"clicks",threads,catalog,keys,canon);
-    canon.routes=FlatMap{};
+    canon.routes=Routes{};
     progress("click parse");
     std::vector<std::unique_ptr<CampaignCounts>> partial(threads);
     std::atomic<size_t> next{0};

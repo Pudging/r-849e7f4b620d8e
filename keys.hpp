@@ -125,16 +125,17 @@ public:
         while (estimated_entries>capacity*7/10) capacity*=2;
         table.resize(capacity);
     }
-    Key insert_or_get(Key k, Key proposed) {
+    Key insert_or_get_hashed(Key k,Key proposed,Key hash) {
         if (!k) throw std::logic_error("empty dictionary key");
         if (table.empty() || (used+1)*10>table.size()*7) grow();
-        auto& s=table[slot(k)];
-        if (!s.k) {
-            s={k,proposed};
-            ++used;
-        }
+        size_t mask=table.size()-1;
+        size_t i=(hash>>PartitionBits)&mask;
+        while (table[i].k && table[i].k!=k) i=(i+1)&mask;
+        auto& s=table[i];
+        if (!s.k) { s={k,proposed}; ++used; }
         return s.value;
     }
+    Key insert_or_get(Key k,Key proposed) { return insert_or_get_hashed(k,proposed,mix(k)); }
     Key get(Key k, Key fallback) const {
         if (!k || table.empty()) return fallback;
         auto& s=table[slot(k)];
@@ -158,6 +159,10 @@ public:
         auto& s=table[slot(k)];
         used+=s.k==0;
         s={k,v};
+    }
+    size_t size() const { return used; }
+    template<class F> void visit(F fn) const {
+        for (const auto& entry:table) if (entry.k) fn(entry.k,entry.value);
     }
     template<class F> void change_values(F f) {
         for (auto &s:table) if (s.k) s.value=f(s.value);
