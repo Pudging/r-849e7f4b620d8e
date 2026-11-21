@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!main.cpp
+!csv.hpp
+!scan.hpp
+!keys.hpp
+!parquet.hpp
