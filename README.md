@@ -1,11 +1,11 @@
-# Team potato — Shopping Sessions
+# Session aggregation
 
 This entry runs DuckDB 1.5.6 on the contest CSV shards. It names each linked group by its smallest user ID, creates sessions from event-time gaps, and computes last-click credit and distinct campaign assists. Both daily aggregates are written as Parquet.
 
 Build the image from this directory.
 
 ```sh
-docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+docker buildx build --platform linux/amd64 --load -t session-worker:latest .
 ```
 
 Use the official DuckDB starter's `scripts/docker_run.sh` to run the image with scorer flags. Set `CPUS` and `MEM` to the capacity of the test machine. The container reads the input at `/data` and requires writable `/output` and `/scratch` mounts for UID 1000.
