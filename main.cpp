@@ -84,7 +84,21 @@ struct Catalog {
     }
 };
 
-FlatMap identities(const fs::path& dir,size_t threads,Keys& keys) {
+struct Identities {
+    FlatMap routes;
+    Bins<Key> names;
+    // Packed text uses at most 60 bits. Interned keys always have bit 63 set.
+    // The remaining 01 prefix can therefore carry a dense group ordinal.
+    static constexpr Key tag=Key(1)<<62;
+    static bool linked(Key token) { return (token>>62)==1; }
+    struct Destination { Key person; size_t bin; };
+    Destination locate(Key source) const {
+        Key token=routes.get(source,source);
+        if (linked(token)) return {tag | ((token^tag)/partitions),part(token)};
+        return {source,bucket(source)};
+    }
+};
+Identities identities(const fs::path& dir,size_t threads,Keys& keys) {
     FlatMap index;
     std::vector<Index> parent,sizes;
     std::vector<Key> names;
@@ -120,14 +134,22 @@ FlatMap identities(const fs::path& dir,size_t threads,Keys& keys) {
         parent[b]=a; sizes[a]+=sizes[b];
         if (keys.less(names[b],names[a])) names[a]=names[b];
     }
+    Identities result;
+    for (size_t i=0;i<parent.size();++i) if (parent[i]==i) {
+        Key name=names[i];
+        size_t bin=bucket(name);
+        names[i]=Identities::tag | (result.names[bin].size()*partitions+bin);
+        result.names[bin].push_back(name);
+    }
     index.change_values([&](Key i){return names[find(i)];});
-    return index;
+    result.routes=std::move(index);
+    return result;
 }
 
 // The common representation is selected from the actual catalog and manifest.
 struct WindowValue {
     static constexpr uint32_t invalid=UINT32_MAX;
-    uint32_t time=invalid, purchase=0;
+    uint32_t time, purchase;
     WindowValue() = default;
     WindowValue(int64_t t, uint32_t price, uint32_t category,const Catalog& cat)
         : time(uint32_t(t-cat.start)), purchase((category<<24)|price) {}
@@ -137,8 +159,8 @@ struct WindowValue {
 };
 struct WideValue {
     static constexpr int64_t invalid=invalid_time;
-    int64_t time=invalid;
-    uint32_t amount=0, product_category=0;
+    int64_t time;
+    uint32_t amount, product_category;
     WideValue() = default;
     WideValue(int64_t t,uint32_t price,uint32_t category,const Catalog&)
         : time(t),amount(price),product_category(category) {}
@@ -149,40 +171,93 @@ struct WideValue {
 
 template<class Value>
 struct Engine {
-struct Event { Key person=0; Value value; };
-struct TimedEvent { Event event; int64_t ingest; };
-struct Reference { Key id; TimedEvent* record; };
+struct Event { Key person; Value value; };
+struct Reference { Key id; Event* record; int64_t ingest; };
 
 // Most successive rows in one hash bucket are nearby in the input order.
 struct Positions {
-    std::vector<Key> hashes;
-    std::vector<uint8_t> distances;
+    // Fixed pages keep the two append-only streams together without copying
+    // millions of entries into progressively larger vector allocations.
+    static constexpr size_t page_size=2048;
+    struct Page {
+        Key hashes[page_size];
+        uint8_t distances[page_size];
+    };
+    std::vector<std::unique_ptr<Page>> pages;
     std::vector<size_t> large;
-    size_t previous=0;
+    size_t previous=0,count=0;
 
     void append(Key hash,size_t position) {
         const size_t distance=position-previous;
-        hashes.push_back(hash);
-        if (distance<255) distances.push_back(uint8_t(distance));
-        else { distances.push_back(255); large.push_back(position); }
+        const size_t i=count++%page_size;
+        if (!i) pages.emplace_back(new Page);
+        Page& page=*pages.back();
+        page.hashes[i]=hash;
+        if (distance<255) page.distances[i]=uint8_t(distance);
+        else { page.distances[i]=255; large.push_back(position); }
         previous=position;
     }
 };
 
-// Payload blocks stay in input order; pointers remain valid until all ID
-// partitions have finished choosing their earliest arrivals.
+// Keep ingestion times beside the payload. A block base represents nearby
+// arrivals exactly in 32 bits, including out-of-order arrivals. Rare values
+// outside the range use a full-width entry at the same position.
 struct EventBatch {
     static constexpr size_t block_size = 8192;
-    size_t count = 0;
-    std::vector<std::unique_ptr<TimedEvent[]>> blocks;
+    struct Block {
+        Event events[block_size];
+        uint32_t arrivals[block_size];
+        int64_t base;
+        std::unique_ptr<int64_t[]> exceptions;
+        explicit Block(int64_t first)
+            :base(first<INT64_MIN+INT32_MAX ? INT64_MIN : first-INT32_MAX) {}
+        int64_t ingest(size_t pos) const {
+            return arrivals[pos]==UINT32_MAX ? exceptions[pos] : base+arrivals[pos];
+        }
+        Event& set(size_t pos,int64_t time) {
+            const uint64_t offset=uint64_t(time)-uint64_t(base);
+            if (time>=base && offset<UINT32_MAX) arrivals[pos]=uint32_t(offset);
+            else {
+                arrivals[pos]=UINT32_MAX;
+                if (!exceptions) exceptions.reset(new int64_t[block_size]);
+                exceptions[pos]=time;
+            }
+            return events[pos];
+        }
+    };
+    size_t count=0;
+    std::vector<std::unique_ptr<Block>> blocks;
     std::array<Positions,partitions> ids;
-    TimedEvent* append() {
-        if (count % block_size == 0) blocks.emplace_back(new TimedEvent[block_size]);
-        return &blocks.back()[count++ % block_size];
+    Event& append(int64_t ingest) {
+        const size_t pos=count++%block_size;
+        if (!pos) blocks.emplace_back(new Block(ingest));
+        return blocks.back()->set(pos,ingest);
     }
 };
-struct Click { Key person, id; int64_t time; Index campaign; };
-using EventGroups=std::vector<Bins<Event>>;
+struct ClickValue { Key id; int64_t time; Index campaign; };
+struct Click { Key person; ClickValue value; };
+// Routing writes to many bins concurrently. Fixed pages let each bin grow
+// without reallocating and copying previously routed rows.
+template<class T> struct Payloads {
+    static constexpr size_t capacity=2048;
+    size_t count=0;
+    std::vector<std::unique_ptr<T[]>> pages;
+    void append(const T& row) {
+        size_t i=count++%capacity;
+        if (!i) pages.emplace_back(new T[capacity]);
+        pages.back()[i]=row;
+    }
+    template<class F> void visit(F fn) {
+        size_t left=count;
+        for (auto& page:pages) {
+            const size_t take=std::min(left,capacity);
+            for (size_t i=0;i<take;++i) fn(page[i]);
+            left-=take;
+        }
+    }
+};
+template<class T> using Routed=std::vector<std::array<Payloads<T>,partitions>>;
+using EventGroups=Routed<Event>;
 
 std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Catalog& cat, Keys& keys) {
     std::vector<EventBatch> raw(workers);
@@ -192,16 +267,16 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
         if (!ingest) return;
         Key hash=mix(keys.encode(v[0]));
         auto& batch=raw[worker];
-        auto* row=batch.append();
-        row->ingest=*ingest;
+        Event& row=batch.append(*ingest);
+        row.value.time=Value::invalid;
         auto time=timestamp(v[2]);
         if (!v[1].empty() && !v[5].empty() && time && *time>=cat.start && *time<cat.end
                 && *time>=*ingest-day_ms) {
             auto amount = v[4]=="purchase" ? number(v[6]) : std::nullopt;
             if (v[4]=="view" || v[4]=="cart" || (amount && *amount>=1 && *amount<=10'000'000)) {
-                row->event.person=keys.encode(v[1]);
+                row.person=keys.encode(v[1]);
                 const uint32_t category=amount ? cat.products.get(keys.encode(v[5]),0) : 0;
-                row->event.value=Value(*time,amount.value_or(0),category,cat);
+                row.value=Value(*time,amount.value_or(0),category,cat);
             }
         }
         // Retain the ID and arrival even if the event is invalid. An early
@@ -212,10 +287,10 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
     return raw;
 }
 
-EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMap& canon) {
+EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const Identities& canon) {
     parallel(partitions,threads,[&](size_t p) {
         size_t n=0;
-        for (const auto& batch:raw) n+=batch.ids[p].hashes.size();
+        for (const auto& batch:raw) n+=batch.ids[p].count;
         if (!n) return;
         size_t words=1;
         while (words<n/4) words*=2;
@@ -223,10 +298,18 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMa
         auto fingerprint=[&](Key hash) {
             return std::pair<size_t,uint64_t>{(hash>>12)&(words-1),uint64_t(1)<<((hash>>6)&63)};
         };
-        for (const auto& batch:raw) for (auto hash:batch.ids[p].hashes) {
-            auto [word,bit]=fingerprint(hash);
-            repeated[word]|=seen[word]&bit;
-            seen[word]|=bit;
+        for (const auto& batch:raw) {
+            const auto& ids=batch.ids[p];
+            size_t left=ids.count;
+            for (const auto& page:ids.pages) {
+                const size_t take=std::min(left,Positions::page_size);
+                for (size_t i=0;i<take;++i) {
+                    auto [word,bit]=fingerprint(page->hashes[i]);
+                    repeated[word]|=seen[word]&bit;
+                    seen[word]|=bit;
+                }
+                left-=take;
+            }
         }
         // Rank gives each occupied repeated bit one owner. All collisions
         // with the original owner spill to an exact sort. A spill key can
@@ -240,32 +323,39 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMa
         for (auto& batch:raw) {
             auto& ids=batch.ids[p];
             size_t position=0,escape=0;
-            for (size_t i=0;i<ids.hashes.size();++i) {
-                const auto distance=ids.distances[i];
-                position=distance<255 ? position+distance : ids.large[escape++];
-                const auto hash=ids.hashes[i];
-                auto [word,bit]=fingerprint(hash);
-                const auto mask=repeated[word];
-                if (!(mask&bit)) continue;
-                auto* record=&batch.blocks[position/EventBatch::block_size][position%EventBatch::block_size];
-                auto& owner=first[seen[word]+__builtin_popcountll(mask&(bit-1))];
-                if (!owner.record) owner={hash,record};
-                else if (owner.id!=hash) exact.push_back({hash,record});
-                else {
-                    if (record->ingest<owner.record->ingest) std::swap(record,owner.record);
-                    record->event.value.time=Value::invalid;
+            size_t left=ids.count;
+            for (const auto& page:ids.pages) {
+                const size_t take=std::min(left,Positions::page_size);
+                for (size_t i=0;i<take;++i) {
+                    const auto distance=page->distances[i];
+                    position=distance<255 ? position+distance : ids.large[escape++];
+                    const auto hash=page->hashes[i];
+                    auto [word,bit]=fingerprint(hash);
+                    const auto mask=repeated[word];
+                    if (!(mask&bit)) continue;
+                    auto& block=*batch.blocks[position/EventBatch::block_size];
+                    size_t offset=position%EventBatch::block_size;
+                    Reference entry{hash,&block.events[offset],block.ingest(offset)};
+                    auto& owner=first[seen[word]+__builtin_popcountll(mask&(bit-1))];
+                    if (!owner.record) owner=entry;
+                    else if (owner.id!=hash) exact.push_back(entry);
+                    else {
+                        if (entry.ingest<owner.ingest) std::swap(entry,owner);
+                        entry.record->value.time=Value::invalid;
+                    }
                 }
+                left-=take;
             }
             ids=Positions{};
         }
         std::sort(exact.begin(),exact.end(),[](auto a,auto b){return a.id<b.id;});
         for (size_t i=0;i<exact.size();) {
             size_t next=i+1;
-            auto* best=exact[i].record;
+            auto best=exact[i];
             while (next<exact.size() && exact[next].id==exact[i].id) {
-                auto* other=exact[next++].record;
-                if (other->ingest<best->ingest) std::swap(other,best);
-                other->event.value.time=Value::invalid;
+                auto other=exact[next++];
+                if (other.ingest<best.ingest) std::swap(other,best);
+                other.record->value.time=Value::invalid;
             }
             i=next;
         }
@@ -280,15 +370,15 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMa
         for (auto& block:batch.blocks) {
             size_t count=std::min(remaining,EventBatch::block_size);
             for (size_t i=0;i<count;++i) {
-                Event e=block[i].event;
-                if (e.value.time==Value::invalid) continue;
+                if (block->events[i].value.time==Value::invalid) continue;
+                Event e=block->events[i];
                 auto& slot=cached[(e.person>>12)&255];
                 if (slot.source!=e.person) {
-                    Key person=canon.get(e.person,e.person);
-                    slot={e.person,person,bucket(person)};
+                    auto dest=canon.locate(e.person);
+                    slot={e.person,dest.person,dest.bin};
                 }
                 e.person=slot.person;
-                clean[w][slot.bin].push_back(e);
+                clean[w][slot.bin].append(e);
             }
             block.reset();
             remaining-=count;
@@ -297,16 +387,16 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMa
     return clean;
 }
 
-std::vector<Bins<Click>> read_clicks(const fs::path& dir,size_t threads,const Catalog& cat, Keys& keys,const FlatMap& canon) {
-    std::vector<Bins<Click>> result(threads);
+Routed<Click> read_clicks(const fs::path& dir,size_t threads,const Catalog& cat, Keys& keys,const Identities& canon) {
+    Routed<Click> result(threads);
     parsed_records<4>(dir,threads,[&](const auto& v,size_t worker){
         if (v[0].empty() || v[1].empty()) return;
         auto time=timestamp(v[3]);
         if (!time || *time<cat.start-week_ms || *time>=cat.end) return;
         Index campaign=cat.campaign_index.get(keys.encode(v[2]),0);
         if (!campaign) return;
-        Key user=keys.encode(v[1]), person=canon.get(user,user);
-        result[worker][bucket(person)].push_back({person,keys.encode(v[0]),*time,campaign});
+        auto dest=canon.locate(keys.encode(v[1]));
+        result[worker][dest.bin].append({dest.person,{keys.encode(v[0]),*time,campaign}});
     });
     return result;
 }
@@ -371,12 +461,13 @@ struct CampaignWindow {
 
 using PurchaseEvent = Value;
 
-void user_days(size_t person,CampaignWindow& window,const std::vector<PurchaseEvent>& es,size_t first,size_t stop,
-               const std::vector<Click>& cs,size_t left,size_t click_end,
-               const Catalog& cat,const Keys& keys,CampaignCounts& counts,std::vector<UserRow>& rows) {
+void user_days(const std::string& person,CampaignWindow& window,const std::vector<PurchaseEvent>& es,size_t first,size_t stop,
+               const std::vector<ClickValue>& cs,size_t left,size_t click_end,
+               const Catalog& cat,const Keys& keys,CampaignCounts& counts,UserWriter& writer,
+               std::vector<std::pair<Index,int64_t>>& sums) {
     size_t right=left;
     window.reset();
-    std::vector<std::pair<Index,int64_t>> sums;
+    bool first_day=true;
     UserRow day{};
     auto finish=[&] {
         if (!day.sessions) return;
@@ -386,7 +477,8 @@ void user_days(size_t person,CampaignWindow& window,const std::vector<PurchaseEv
             });
             day.category=best->first;
         }
-        rows.push_back(day);
+        writer.append(day,person,first_day);
+        first_day=false;
         day={};
         sums.clear();
     };
@@ -394,7 +486,7 @@ void user_days(size_t person,CampaignWindow& window,const std::vector<PurchaseEv
         int64_t start=es[first].absolute(cat);
         int32_t date=start/day_ms-(start%day_ms<0);
         if (day.sessions && day.day!=date) finish();
-        if (!day.sessions) {day.person=person; day.day=date; day.category=std::numeric_limits<Index>::max();}
+        if (!day.sessions) {day.day=date; day.category=std::numeric_limits<Index>::max();}
         while (right<click_end && cs[right].time<=start) window.add(cs[right++].campaign);
         while (left<right && cs[left].time<start-week_ms) {
             window.remove(cs[left++].campaign);
@@ -423,8 +515,7 @@ void user_days(size_t person,CampaignWindow& window,const std::vector<PurchaseEv
 // Count exact canonical IDs first. Within one person's range timestamp is
 // the sole event sort key. Person ranges also index the two sides of the join.
 struct PersonGroup {
-    Key person;
-    size_t events=0,clicks=0,event_end=0,click_end=0;
+    size_t events=0,clicks=0;
 };
 // Three stable counting passes sort large compact groups. Small groups and
 // full-width timestamp groups use comparison sorting.
@@ -463,68 +554,68 @@ static void sort_events(std::vector<Value>& events,size_t first,size_t count,
     }
     std::sort(begin,begin+count,[](auto a,auto b){return a.time<b.time;});
 }
-void reduce_partition(size_t p,EventGroups& events,std::vector<Bins<Click>>& clicks,
+void reduce_partition(size_t p,EventGroups& events,Routed<Click>& clicks,std::vector<Key>& names,
                       const Catalog& cat,const Keys& keys,CampaignCounts& counts,
-                      std::vector<UserRow>& rows,std::vector<std::string>& names) {
-    std::vector<PersonGroup> groups;
-    // bucket(person) fixes the low hash bits for every person in this map.
-    // Start probing with independent bits so adjacent slots stay usable.
+                      const fs::path& output,bool narrow_counts) {
+    // Only singleton keys require a dictionary probe. Annotate them once
+    // so that all event payloads share the same direct-index scatter.
     static_assert(partitions==64);
-    KeyMap<6> people;
-    Key last=0;
-    size_t group=0;
-    for (const auto& batch:events) for (const auto& e:batch[p]) {
-        if (e.person!=last) {
-            group=people.insert_or_get(e.person,groups.size());
-            if (group==groups.size()) groups.push_back({e.person});
-            last=e.person;
+    KeyMap<6> singletons;
+    std::vector<PersonGroup> groups(names.size());
+    for (auto& batch:events) batch[p].visit([&](Event& e) {
+        if (!Identities::linked(e.person)) {
+            size_t i=singletons.insert_or_get(e.person,names.size());
+            if (i==names.size()) { names.push_back(e.person); groups.emplace_back(); }
+            e.person=Identities::tag|i;
         }
-        ++groups[group].events;
-    }
-    constexpr size_t missing=std::numeric_limits<size_t>::max();
-    auto locate=[&](Key person) {
-        if (last!=person) { last=person; group=people.get(person,missing); }
-        return group;
-    };
-    for (const auto& batch:clicks) for (const auto& c:batch[p]) {
-        auto i=locate(c.person);
-        if (i!=missing) ++groups[i].clicks;
-    }
+        ++groups[e.person^Identities::tag].events;
+    });
+    constexpr Key missing=UINT64_MAX;
+    for (auto& batch:clicks) batch[p].visit([&](Click& c) {
+        if (!Identities::linked(c.person)) {
+            size_t i=singletons.get(c.person,missing);
+            if (i==missing) { c.person=missing; return; }
+            c.person=Identities::tag|i;
+        }
+        ++groups[c.person^Identities::tag].clicks;
+    });
+    singletons={};
     size_t ne=0,nc=0;
     for (auto& g:groups) {
-        g.event_end=ne; ne+=g.events;
-        g.click_end=nc; nc+=g.clicks;
+        ne+=g.events; g.events=ne;
+        nc+=g.clicks; g.clicks=nc;
     }
-    std::vector<PurchaseEvent> es(ne);
-    std::vector<Click> cs(nc);
+    std::vector<Value> es(ne);
+    std::vector<ClickValue> cs(nc);
     for (auto& batch:events) {
-        for (const auto& e:batch[p]) {
-            auto& g=groups[locate(e.person)];
-            es[g.event_end++]=e.value;
-        }
-        std::vector<Event>().swap(batch[p]);
+        batch[p].visit([&](const Event& e){es[--groups[e.person^Identities::tag].events]=e.value;});
+        batch[p]={};
     }
     for (auto& batch:clicks) {
-        for (const auto& c:batch[p]) {
-            auto i=locate(c.person);
-            if (i!=missing) cs[groups[i].click_end++]=c;
-        }
-        std::vector<Click>().swap(batch[p]);
+        batch[p].visit([&](const Click& c) {
+            if (c.person!=missing) cs[--groups[c.person^Identities::tag].clicks]=c.value;
+        });
+        batch[p]={};
     }
-    names.reserve(groups.size());
+    if (!ne && p!=0) return;
+    UserWriter writer((output/("part-"+std::to_string(p)+".parquet")).string(),cat.category_names,narrow_counts);
+    groups.push_back({ne,nc});
     CampaignWindow window(cat.campaigns.size());
     std::vector<Value> scratch;
-    for (const auto& g:groups) {
-        size_t first=g.event_end-g.events, left=g.click_end-g.clicks;
-        sort_events(es,first,g.events,scratch);
-        auto begin=cs.begin()+left, end=cs.begin()+g.click_end;
+    std::vector<std::pair<Index,int64_t>> sums;
+    for (size_t i=0;i<names.size();++i) {
+        const auto first=groups[i].events,stop=groups[i+1].events;
+        if (first==stop) continue;
+        sort_events(es,first,stop-first,scratch);
+        auto left=groups[i].clicks;
+        auto begin=cs.begin()+left,end=cs.begin()+groups[i+1].clicks;
         std::sort(begin,end,[&](const auto& a,const auto& b){
             return a.time==b.time ? keys.less(b.id,a.id) : a.time<b.time;
         });
         end=std::unique(begin,end,[](const auto& a,const auto& b){return a.id==b.id;});
-        names.push_back(keys.decode(g.person));
-        user_days(names.size()-1,window,es,first,g.event_end,cs,left,end-cs.begin(),cat,keys,counts,rows);
+        user_days(keys.decode(names[i]),window,es,first,stop,cs,left,end-cs.begin(),cat,keys,counts,writer,sums);
     }
+    writer.close();
 }
 
 void run(const fs::path& input,const fs::path& output,size_t threads,Keys& keys,const Catalog& catalog,
@@ -540,20 +631,21 @@ void run(const fs::path& input,const fs::path& output,size_t threads,Keys& keys,
                           [&]{return identities(input/"links",1,keys);});
     auto raw=parse_events(input/"events",threads>1 ? threads-1 : 1,catalog,keys);
     auto canon=links.get();
+    uint64_t physical_rows=0;
+    for (const auto& batch:raw) physical_rows+=batch.count;
     progress("catalog, identities and event parse");
     auto events=deduplicate(raw,threads,canon);
     progress("event deduplication");
     auto clicks=read_clicks(input/"clicks",threads,catalog,keys,canon);
-    canon=FlatMap{};
+    canon.routes=FlatMap{};
     progress("click parse");
-    std::vector<std::unique_ptr<CampaignCounts>> partial(partitions);
-    parallel(partitions,threads,[&](size_t p){
-        std::vector<UserRow> rows;
-        std::vector<std::string> names;
-        partial[p]=std::make_unique<CampaignCounts>(catalog);
-        reduce_partition(p,events,clicks,catalog,keys,*partial[p],rows,names);
-        if (p==0 || !rows.empty())
-            write_users((output/"user_daily"/("part-"+std::to_string(p)+".parquet")).string(),rows,names,catalog.category_names);
+    std::vector<std::unique_ptr<CampaignCounts>> partial(threads);
+    std::atomic<size_t> next{0};
+    parallel(threads,threads,[&](size_t worker){
+        partial[worker]=std::make_unique<CampaignCounts>(catalog);
+        for (size_t p;(p=next.fetch_add(1))<partitions;)
+            reduce_partition(p,events,clicks,canon.names[p],catalog,keys,*partial[worker],output/"user_daily",
+                             physical_rows<=INT32_MAX);
     });
     SparseCounts merged;
     for (const auto& group:partial) group->merge(merged);
