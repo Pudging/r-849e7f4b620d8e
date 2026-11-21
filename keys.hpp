@@ -103,12 +103,13 @@ public:
 
 // Nonempty IDs never encode to zero. The table has no deletions and freezes
 // before parallel reads. Collision resolution compares the complete key.
-class FlatMap {
+template<unsigned PartitionBits>
+class KeyMap {
     struct Slot { Key k=0, value=0; };
     std::vector<Slot> table;
     size_t used=0;
     size_t slot(Key key) const {
-        size_t mask = table.size()-1, i=mix(key)&mask;
+        size_t mask = table.size()-1, i=(mix(key)>>PartitionBits)&mask;
         while (table[i].k && table[i].k!=key) i=(i+1)&mask;
         return i;
     }
@@ -150,4 +151,5 @@ public:
         for (auto &s:table) if (s.k) s.value=f(s.value);
     }
 };
+using FlatMap=KeyMap<0>;
 }

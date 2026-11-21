@@ -124,7 +124,32 @@ FlatMap identities(const fs::path& dir,size_t threads,Keys& keys) {
     return index;
 }
 
-struct Event { Key person=0; int64_t time=invalid_time; uint32_t price=0, category=0; };
+// The common representation is selected from the actual catalog and manifest.
+struct WindowValue {
+    static constexpr uint32_t invalid=UINT32_MAX;
+    uint32_t time=invalid, purchase=0;
+    WindowValue() = default;
+    WindowValue(int64_t t, uint32_t price, uint32_t category,const Catalog& cat)
+        : time(uint32_t(t-cat.start)), purchase((category<<24)|price) {}
+    int64_t absolute(const Catalog& cat) const { return cat.start+time; }
+    uint32_t price() const { return purchase&0xffffff; }
+    uint32_t category() const { return purchase>>24; }
+};
+struct WideValue {
+    static constexpr int64_t invalid=invalid_time;
+    int64_t time=invalid;
+    uint32_t amount=0, product_category=0;
+    WideValue() = default;
+    WideValue(int64_t t,uint32_t price,uint32_t category,const Catalog&)
+        : time(t),amount(price),product_category(category) {}
+    int64_t absolute(const Catalog&) const { return time; }
+    uint32_t price() const { return amount; }
+    uint32_t category() const { return product_category; }
+};
+
+template<class Value>
+struct Engine {
+struct Event { Key person=0; Value value; };
 struct TimedEvent { Event event; int64_t ingest; };
 struct Reference { Key id; TimedEvent* record; };
 
@@ -158,11 +183,9 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
                 && *time>=*ingest-day_ms) {
             auto amount = v[4]=="purchase" ? number(v[6]) : std::nullopt;
             if (v[4]=="view" || v[4]=="cart" || (amount && *amount>=1 && *amount<=10'000'000)) {
-                row->event.person=keys.encode(v[1]); row->event.time=*time;
-                if (amount) {
-                    row->event.price=*amount;
-                    row->event.category=cat.products.get(keys.encode(v[5]),0);
-                }
+                row->event.person=keys.encode(v[1]);
+                const uint32_t category=amount ? cat.products.get(keys.encode(v[5]),0) : 0;
+                row->event.value=Value(*time,amount.value_or(0),category,cat);
             }
         }
         // Retain the ID and arrival even if the event is invalid. An early
@@ -203,7 +226,7 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMa
             while (next<exact.size() && exact[next].id==exact[i].id) {
                 auto* other=exact[next++].record;
                 if (other->ingest<best->ingest) std::swap(other,best);
-                other->event.time=invalid_time;
+                other->event.value.time=Value::invalid;
             }
             i=next;
         }
@@ -219,7 +242,7 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const FlatMa
             size_t count=std::min(remaining,EventBatch::block_size);
             for (size_t i=0;i<count;++i) {
                 Event e=block[i].event;
-                if (e.time==invalid_time) continue;
+                if (e.value.time==Value::invalid) continue;
                 auto& slot=cached[(e.person>>12)&255];
                 if (slot.source!=e.person) {
                     Key person=canon.get(e.person,e.person);
@@ -251,7 +274,7 @@ std::vector<Bins<Click>> read_clicks(const fs::path& dir,size_t threads,const Ca
 
 using Totals=std::array<int64_t,4>;
 using SparseCounts=std::unordered_map<uint64_t,Totals>;
-inline uint64_t campaign_day(uint32_t c, int32_t date) {
+static uint64_t campaign_day(uint32_t c, int32_t date) {
     return (uint64_t(c)<<32)|uint32_t(date);
 }
 
@@ -307,7 +330,7 @@ struct CampaignWindow {
     }
 };
 
-struct PurchaseEvent { int64_t time; uint32_t price,category; };
+using PurchaseEvent = Value;
 
 void user_days(size_t person,CampaignWindow& window,const std::vector<PurchaseEvent>& es,size_t first,size_t stop,
                const std::vector<Click>& cs,size_t left,size_t click_end,
@@ -329,7 +352,7 @@ void user_days(size_t person,CampaignWindow& window,const std::vector<PurchaseEv
         sums.clear();
     };
     while (first<stop) {
-        int64_t start=es[first].time;
+        int64_t start=es[first].absolute(cat);
         int32_t date=start/day_ms-(start%day_ms<0);
         if (day.sessions && day.day!=date) finish();
         if (!day.sessions) {day.person=person; day.day=date; day.category=std::numeric_limits<Index>::max();}
@@ -342,11 +365,11 @@ void user_days(size_t person,CampaignWindow& window,const std::vector<PurchaseEv
         int64_t revenue=0;
         do {
             auto &e=es[next++];
-            if (e.price) {
-                revenue+=e.price;
-                auto it=std::find_if(sums.begin(),sums.end(),[&](auto& x){return x.first==e.category;});
-                if (it==sums.end()) sums.emplace_back(e.category,e.price);
-                else it->second+=e.price;
+            if (e.price()) {
+                revenue+=e.price();
+                auto it=std::find_if(sums.begin(),sums.end(),[&](auto& x){return x.first==e.category();});
+                if (it==sums.end()) sums.emplace_back(e.category(),e.price());
+                else it->second+=e.price();
             }
         } while (next<stop && es[next].time-es[next-1].time<=1'800'000);
         ++day.sessions; day.events+=next-first; day.revenue+=revenue;
@@ -364,11 +387,51 @@ struct PersonGroup {
     Key person;
     size_t events=0,clicks=0,event_end=0,click_end=0;
 };
+// Three stable counting passes sort large compact groups. Small groups and
+// full-width timestamp groups use comparison sorting.
+static void sort_events(std::vector<Value>& events,size_t first,size_t count,
+                        std::vector<Value>& scratch) {
+    auto begin=events.begin()+first;
+    if constexpr (std::is_same_v<Value,WindowValue>) {
+        if (count>=2048) {
+            std::array<std::array<size_t,2048>,3> offsets{};
+            for (size_t i=0;i<count;++i) {
+                auto time=begin[i].time;
+                ++offsets[0][time&2047];
+                ++offsets[1][(time>>11)&2047];
+                ++offsets[2][time>>22];
+            }
+            scratch.resize(count);
+            Value* src=events.data()+first;
+            Value* dst=scratch.data();
+            for (unsigned pass=0;pass<3;++pass) {
+                size_t total=0;
+                auto& pos=offsets[pass];
+                for (auto& end:pos) {
+                    size_t size=end;
+                    end=total;
+                    total+=size;
+                }
+                for (size_t i=0;i<count;++i) {
+                    auto value=src[i];
+                    dst[pos[(value.time>>(11*pass))&2047]++]=value;
+                }
+                std::swap(src,dst);
+            }
+            std::copy_n(src,count,dst);
+            return;
+        }
+    }
+    std::sort(begin,begin+count,[](auto a,auto b){return a.time<b.time;});
+}
 void reduce_partition(size_t p,EventGroups& events,std::vector<Bins<Click>>& clicks,
                       const Catalog& cat,const Keys& keys,CampaignCounts& counts,
                       std::vector<UserRow>& rows,std::vector<std::string>& names) {
     std::vector<PersonGroup> groups;
-    FlatMap people;
+    // bucket(person) fixes the low hash bits for every person in this map.
+    // Start probing with independent bits so adjacent slots stay usable.
+    static_assert(partitions==64);
+    KeyMap<6> people;
     Key last=0;
     size_t group=0;
     for (const auto& batch:events) for (const auto& e:batch[p]) {
@@ -398,7 +461,7 @@ void reduce_partition(size_t p,EventGroups& events,std::vector<Bins<Click>>& cli
     for (auto& batch:events) {
         for (const auto& e:batch[p]) {
             auto& g=groups[locate(e.person)];
-            es[g.event_end++]={e.time,e.price,e.category};
+            es[g.event_end++]=e.value;
         }
         std::vector<Event>().swap(batch[p]);
     }
@@ -411,9 +474,10 @@ void reduce_partition(size_t p,EventGroups& events,std::vector<Bins<Click>>& cli
     }
     names.reserve(groups.size());
     CampaignWindow window(cat.campaigns.size());
+    std::vector<Value> scratch;
     for (const auto& g:groups) {
         size_t first=g.event_end-g.events, left=g.click_end-g.clicks;
-        std::sort(es.begin()+first,es.begin()+g.event_end,[](auto a,auto b){return a.time<b.time;});
+        sort_events(es,first,g.events,scratch);
         auto begin=cs.begin()+left, end=cs.begin()+g.click_end;
         std::sort(begin,end,[&](const auto& a,const auto& b){
             return a.time==b.time ? keys.less(b.id,a.id) : a.time<b.time;
@@ -424,16 +488,15 @@ void reduce_partition(size_t p,EventGroups& events,std::vector<Bins<Click>>& cli
     }
 }
 
-void run(const fs::path& input,const fs::path& output,size_t threads) {
-    auto start=std::chrono::steady_clock::now();
+void run(const fs::path& input,const fs::path& output,size_t threads,Keys& keys,const Catalog& catalog,
+         std::chrono::steady_clock::time_point start) {
     auto progress=[&](const char* phase) {
         double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
         std::cerr<<phase<<" elapsed seconds "<<seconds<<'\n';
     };
     fs::create_directories(output/"user_daily");
     fs::create_directories(output/"campaign_daily");
-    Keys keys;
-    Catalog catalog(input,keys);
+
     auto links=std::async(threads>1 ? std::launch::async : std::launch::deferred,
                           [&]{return identities(input/"links",1,keys);});
     auto raw=parse_events(input/"events",threads>1 ? threads-1 : 1,catalog,keys);
@@ -462,6 +525,19 @@ void run(const fs::path& input,const fs::path& output,size_t threads) {
     }
     write_campaigns((output/"campaign_daily"/"part-0.parquet").string(),rows);
     progress("all outputs");
+}
+};
+
+void run(const fs::path& input,const fs::path& output,size_t threads) {
+    auto start=std::chrono::steady_clock::now();
+    Keys keys;
+    Catalog catalog(input,keys);
+    if (catalog.end>catalog.start && uint64_t(catalog.end-catalog.start)<=UINT32_MAX &&
+        catalog.categories.size()<=256) {
+        Engine<WindowValue>{}.run(input,output,threads,keys,catalog,start);
+    } else {
+        Engine<WideValue>{}.run(input,output,threads,keys,catalog,start);
+    }
 }
 }
 
