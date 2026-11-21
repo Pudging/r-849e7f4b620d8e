@@ -122,7 +122,16 @@ inline std::optional<std::int64_t> scalar_timestamp(std::string_view text) {
 inline std::optional<std::int64_t> timestamp(std::string_view text) {
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && !defined(SHOP_SCALAR)
     // Cache validated dates only. A hit requires equality of all ten date bytes.
-    if (text.size() == 20 && text[10] == 'T' && text[19] == 'Z') {
+    if ((text.size()==20 || text.size()==25) && text[10]=='T') {
+        int offset=0;
+        if (text.size()==20) {
+            if (text[19]!='Z') return {};
+        } else {
+            if ((text[19]!='+' && text[19]!='-') || text[22]!=':') return {};
+            int h=csv_detail::two_digits(text.data()+20), m=csv_detail::two_digits(text.data()+23);
+            if (h<0 || h>23 || m<0 || m>59) return {};
+            offset=(h*60+m)*60000*(text[19]=='+' ? 1 : -1);
+        }
         struct Date { uint64_t prefix = 0; uint16_t suffix = 0; int64_t midnight = 0; bool valid = false; };
         static thread_local std::array<Date, 64> cache;
         const char* s = text.data();
@@ -140,9 +149,9 @@ inline std::optional<std::int64_t> timestamp(std::string_view text) {
         unsigned hour = pair(x), minute = pair(x >> 24), second = pair(x >> 48);
         if (hour >= 24 || minute >= 60 || second >= 60) return {};
         int64_t elapsed = ((hour * 60 + minute) * 60 + second) * 1000;
-        if (date.valid && date.prefix == prefix && date.suffix == suffix) return date.midnight + elapsed;
+        if (date.valid && date.prefix == prefix && date.suffix == suffix) return date.midnight + elapsed - offset;
         auto result = scalar_timestamp(text);
-        if (result) date = {prefix, suffix, *result - elapsed, true};
+        if (result) date = {prefix, suffix, *result - elapsed + offset, true};
         return result;
     }
 #endif

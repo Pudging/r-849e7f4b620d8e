@@ -92,10 +92,10 @@ struct Identities {
     static constexpr Key tag=Key(1)<<62;
     static bool linked(Key token) { return (token>>62)==1; }
     struct Destination { Key person; size_t bin; };
-    Destination locate(Key source) const {
-        Key token=routes.get(source,source);
-        if (linked(token)) return {tag | ((token^tag)/partitions),part(token)};
-        return {source,bucket(source)};
+    Destination locate(Key source,uint64_t hash) const {
+        Key route=routes.lookup_hashed(source,hash);
+        return route ? Destination{tag|((route^tag)/partitions),part(route)}
+                     : Destination{source,part(hash)};
     }
 };
 Identities identities(const fs::path& dir,size_t threads,Keys& keys) {
@@ -174,67 +174,80 @@ struct Engine {
 struct Event { Key person; Value value; };
 struct Reference { Key id; Event* record; int64_t ingest; };
 
-// Most successive rows in one hash bucket are nearby in the input order.
-struct Positions {
-    // Fixed pages keep the two append-only streams together without copying
-    // millions of entries into progressively larger vector allocations.
-    static constexpr size_t page_size=2048;
-    struct Page {
-        Key hashes[page_size];
-        uint8_t distances[page_size];
-    };
-    std::vector<std::unique_ptr<Page>> pages;
-    std::vector<size_t> large;
-    size_t previous=0,count=0;
-
-    void append(Key hash,size_t position) {
-        const size_t distance=position-previous;
-        const size_t i=count++%page_size;
-        if (!i) pages.emplace_back(new Page);
-        Page& page=*pages.back();
-        page.hashes[i]=hash;
-        if (distance<255) page.distances[i]=uint8_t(distance);
-        else { page.distances[i]=255; large.push_back(position); }
-        previous=position;
+// Input workers own fixed pages partitioned by full event-ID hash. The same
+// page holds the identity, event value and arrival time throughout arbitration.
+struct EventPage {
+    static constexpr size_t capacity=2048;
+    Key hashes[capacity];
+    uint32_t arrivals[capacity];
+    Event events[capacity];
+    int64_t base;
+    std::unique_ptr<int64_t[]> exceptions;
+    explicit EventPage(int64_t first)
+        :base(first<INT64_MIN+INT32_MAX ? INT64_MIN : first-INT32_MAX) {}
+    int64_t ingest(size_t pos) const {
+        return arrivals[pos]==UINT32_MAX ? exceptions[pos] : base+arrivals[pos];
+    }
+    Event& set(size_t pos,Key hash,int64_t time) {
+        hashes[pos]=hash;
+        uint64_t delta=uint64_t(time)-uint64_t(base);
+        if (time>=base && delta<UINT32_MAX) arrivals[pos]=uint32_t(delta);
+        else {
+            arrivals[pos]=UINT32_MAX;
+            if (!exceptions) exceptions.reset(new int64_t[capacity]);
+            exceptions[pos]=time;
+        }
+        return events[pos];
     }
 };
-
-// Keep ingestion times beside the payload. A block base represents nearby
-// arrivals exactly in 32 bits, including out-of-order arrivals. Rare values
-// outside the range use a full-width entry at the same position.
-struct EventBatch {
-    static constexpr size_t block_size = 8192;
-    struct Block {
-        Event events[block_size];
-        uint32_t arrivals[block_size];
-        int64_t base;
-        std::unique_ptr<int64_t[]> exceptions;
-        explicit Block(int64_t first)
-            :base(first<INT64_MIN+INT32_MAX ? INT64_MIN : first-INT32_MAX) {}
-        int64_t ingest(size_t pos) const {
-            return arrivals[pos]==UINT32_MAX ? exceptions[pos] : base+arrivals[pos];
+struct alignas(64) EventBucket {
+    static constexpr size_t buffer_size=8;
+    struct Staged { Key hash; int64_t ingest; Event event; };
+    Staged pending[buffer_size];
+    size_t count=0, buffered=0;
+    std::vector<std::unique_ptr<EventPage>> pages;
+    void flush() {
+        if (!buffered) return;
+        size_t pos=(count-buffered)%EventPage::capacity;
+        if (!pos) pages.emplace_back(new EventPage(pending[0].ingest));
+        auto& page=*pages.back();
+        for (size_t i=0;i<buffered;++i) {
+            const auto& src=pending[i];
+            page.set(pos+i,src.hash,src.ingest)=src.event;
         }
-        Event& set(size_t pos,int64_t time) {
-            const uint64_t offset=uint64_t(time)-uint64_t(base);
-            if (time>=base && offset<UINT32_MAX) arrivals[pos]=uint32_t(offset);
-            else {
-                arrivals[pos]=UINT32_MAX;
-                if (!exceptions) exceptions.reset(new int64_t[block_size]);
-                exceptions[pos]=time;
-            }
-            return events[pos];
+        buffered=0;
+    }
+    Event& append(Key hash,int64_t ingest) {
+        if (buffered==buffer_size) flush();
+        ++count;
+        auto& slot=pending[buffered++];
+        slot.hash=hash;
+        slot.ingest=ingest;
+        return slot.event;
+    }
+    template<class Fn> void visit(Fn fn) {
+        size_t left=count;
+        for (auto& page:pages) {
+            size_t take=std::min(left,EventPage::capacity);
+            fn(*page,take);
+            left-=take;
         }
-    };
-    size_t count=0;
-    std::vector<std::unique_ptr<Block>> blocks;
-    std::array<Positions,partitions> ids;
-    Event& append(int64_t ingest) {
-        const size_t pos=count++%block_size;
-        if (!pos) blocks.emplace_back(new Block(ingest));
-        return blocks.back()->set(pos,ingest);
     }
 };
-struct ClickValue { Key id; int64_t time; Index campaign; };
+using EventBatch=std::array<EventBucket,partitions>;
+
+// A click can precede the event window by one week. Compact engines store
+// offsets from that earlier bound; wide engines retain absolute milliseconds.
+using ClickTime=std::conditional_t<std::is_same_v<Value,WindowValue>,uint32_t,int64_t>;
+static ClickTime encode_click(int64_t t,const Catalog& cat) {
+    if constexpr (std::is_same_v<Value,WindowValue>) return uint32_t(t-(cat.start-week_ms));
+    return t;
+}
+static int64_t click_time(ClickTime t,const Catalog& cat) {
+    if constexpr (std::is_same_v<Value,WindowValue>) return (cat.start-week_ms)+t;
+    return t;
+}
+struct ClickValue { Key id; ClickTime time; Index campaign; };
 struct Click { Key person; ClickValue value; };
 // Routing writes to many bins concurrently. Fixed pages let each bin grow
 // without reallocating and copying previously routed rows.
@@ -267,7 +280,8 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
         if (!ingest) return;
         Key hash=mix(keys.encode(v[0]));
         auto& batch=raw[worker];
-        Event& row=batch.append(*ingest);
+        Event& row=batch[part(hash)].append(hash,*ingest);
+        row={};
         row.value.time=Value::invalid;
         auto time=timestamp(v[2]);
         if (!v[1].empty() && !v[5].empty() && time && *time>=cat.start && *time<cat.end
@@ -282,60 +296,46 @@ std::vector<EventBatch> parse_events(const fs::path& dir,size_t workers,const Ca
         // Retain the ID and arrival even if the event is invalid. An early
         // invalid event must suppress its later valid duplicates.
         // mix is a permutation on 64-bit words. Comparing full hashes is exact.
-        batch.ids[part(hash)].append(hash,batch.count-1);
+
     });
+    for (auto& batch:raw) for (auto& bin:batch) bin.flush();
     return raw;
 }
 
 EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const Identities& canon) {
-    parallel(partitions,threads,[&](size_t p) {
-        size_t n=0;
-        for (const auto& batch:raw) n+=batch.ids[p].count;
-        if (!n) return;
-        size_t words=1;
-        while (words<n/4) words*=2;
-        std::vector<uint64_t> seen(words),repeated(words);
-        auto fingerprint=[&](Key hash) {
-            return std::pair<size_t,uint64_t>{(hash>>12)&(words-1),uint64_t(1)<<((hash>>6)&63)};
-        };
-        for (const auto& batch:raw) {
-            const auto& ids=batch.ids[p];
-            size_t left=ids.count;
-            for (const auto& page:ids.pages) {
-                const size_t take=std::min(left,Positions::page_size);
-                for (size_t i=0;i<take;++i) {
-                    auto [word,bit]=fingerprint(page->hashes[i]);
+    EventGroups clean(threads);
+    std::atomic<size_t> next{0};
+    parallel(threads,threads,[&](size_t worker) {
+        for (size_t p;(p=next.fetch_add(1,std::memory_order_relaxed))<partitions;) {
+            size_t n=0;
+            for (auto& batch:raw) n+=batch[p].count;
+            if (!n) continue;
+            size_t words=1;
+            while (words<n/4) words*=2;
+            std::vector<uint64_t> seen(words),repeated(words);
+            for (auto& batch:raw) batch[p].visit([&](EventPage& page,size_t size) {
+                for (size_t i=0;i<size;++i) {
+                    Key hash=page.hashes[i];
+                    auto word=(hash>>12)&(words-1);
+                    uint64_t bit=uint64_t(1)<<((hash>>6)&63);
                     repeated[word]|=seen[word]&bit;
                     seen[word]|=bit;
                 }
-                left-=take;
+            });
+            size_t owners=0;
+            for (size_t i=0;i<words;++i) {
+                seen[i]=owners;
+                owners+=__builtin_popcountll(repeated[i]);
             }
-        }
-        // Rank gives each occupied repeated bit one owner. All collisions
-        // with the original owner spill to an exact sort. A spill key can
-        // never match an owner key from a different fingerprint.
-        size_t owners=0;
-        for (size_t i=0;i<words;++i) {
-            seen[i]=owners;
-            owners+=__builtin_popcountll(repeated[i]);
-        }
-        std::vector<Reference> first(owners),exact;
-        for (auto& batch:raw) {
-            auto& ids=batch.ids[p];
-            size_t position=0,escape=0;
-            size_t left=ids.count;
-            for (const auto& page:ids.pages) {
-                const size_t take=std::min(left,Positions::page_size);
-                for (size_t i=0;i<take;++i) {
-                    const auto distance=page->distances[i];
-                    position=distance<255 ? position+distance : ids.large[escape++];
-                    const auto hash=page->hashes[i];
-                    auto [word,bit]=fingerprint(hash);
-                    const auto mask=repeated[word];
+            std::vector<Reference> first(owners),exact;
+            if (owners) for (auto& batch:raw) batch[p].visit([&](EventPage& page,size_t size) {
+                for (size_t i=0;i<size;++i) {
+                    Key hash=page.hashes[i];
+                    auto word=(hash>>12)&(words-1);
+                    uint64_t bit=uint64_t(1)<<((hash>>6)&63);
+                    auto mask=repeated[word];
                     if (!(mask&bit)) continue;
-                    auto& block=*batch.blocks[position/EventBatch::block_size];
-                    size_t offset=position%EventBatch::block_size;
-                    Reference entry{hash,&block.events[offset],block.ingest(offset)};
+                    Reference entry{hash,&page.events[i],page.ingest(i)};
                     auto& owner=first[seen[word]+__builtin_popcountll(mask&(bit-1))];
                     if (!owner.record) owner=entry;
                     else if (owner.id!=hash) exact.push_back(entry);
@@ -344,44 +344,38 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const Identi
                         entry.record->value.time=Value::invalid;
                     }
                 }
-                left-=take;
-            }
-            ids=Positions{};
-        }
-        std::sort(exact.begin(),exact.end(),[](auto a,auto b){return a.id<b.id;});
-        for (size_t i=0;i<exact.size();) {
-            size_t next=i+1;
-            auto best=exact[i];
-            while (next<exact.size() && exact[next].id==exact[i].id) {
-                auto other=exact[next++];
-                if (other.ingest<best.ingest) std::swap(other,best);
-                other.record->value.time=Value::invalid;
-            }
-            i=next;
-        }
-    });
-
-    EventGroups clean(raw.size());
-    parallel(raw.size(),threads,[&](size_t w) {
-        struct Cached {Key source=0, person=0; size_t bin=0;};
-        std::array<Cached,256> cached{};
-        auto& batch=raw[w];
-        size_t remaining=batch.count;
-        for (auto& block:batch.blocks) {
-            size_t count=std::min(remaining,EventBatch::block_size);
-            for (size_t i=0;i<count;++i) {
-                if (block->events[i].value.time==Value::invalid) continue;
-                Event e=block->events[i];
-                auto& slot=cached[(e.person>>12)&255];
-                if (slot.source!=e.person) {
-                    auto dest=canon.locate(e.person);
-                    slot={e.person,dest.person,dest.bin};
+            });
+            std::sort(exact.begin(),exact.end(),[](auto a,auto b){return a.id<b.id;});
+            for (size_t i=0;i<exact.size();) {
+                size_t stop=i+1;
+                auto best=exact[i];
+                while (stop<exact.size() && exact[stop].id==exact[i].id) {
+                    auto other=exact[stop++];
+                    if (other.ingest<best.ingest) std::swap(other,best);
+                    other.record->value.time=Value::invalid;
                 }
-                e.person=slot.person;
-                clean[w][slot.bin].append(e);
+                i=stop;
             }
-            block.reset();
-            remaining-=count;
+            for (auto& batch:raw) {
+                batch[p].visit([&](EventPage& page,size_t size){
+                    constexpr size_t width=48;
+                    for (size_t i=0;i<size;i+=width) {
+                        size_t take=std::min(width,size-i);
+                        uint64_t hashes[width];
+                        for (size_t k=0;k<take;++k) {
+                            hashes[k]=mix(page.events[i+k].person);
+                            canon.routes.prefetch(hashes[k]);
+                        }
+                        for (size_t k=0;k<take;++k) {
+                            auto& e=page.events[i+k];
+                            if (e.value.time==Value::invalid) continue;
+                            auto dest=canon.locate(e.person,hashes[k]);
+                            clean[worker][dest.bin].append({dest.person,e.value});
+                        }
+                    }
+                });
+                batch[p].pages.clear();
+            }
         }
     });
     return clean;
@@ -389,15 +383,38 @@ EventGroups deduplicate(std::vector<EventBatch>& raw,size_t threads,const Identi
 
 Routed<Click> read_clicks(const fs::path& dir,size_t threads,const Catalog& cat, Keys& keys,const Identities& canon) {
     Routed<Click> result(threads);
+    constexpr size_t batch_size=48;
+    struct alignas(64) Batch {
+        Click rows[batch_size];
+        uint64_t hashes[batch_size];
+        size_t count=0;
+    };
+    std::vector<Batch> batches(threads);
+    auto flush=[&](size_t w) {
+        auto& batch=batches[w];
+        for (size_t i=0;i<batch.count;++i) {
+            Click& c=batch.rows[i];
+            auto dest=canon.locate(c.person,batch.hashes[i]);
+            c.person=dest.person;
+            result[w][dest.bin].append(c);
+        }
+        batch.count=0;
+    };
     parsed_records<4>(dir,threads,[&](const auto& v,size_t worker){
         if (v[0].empty() || v[1].empty()) return;
         auto time=timestamp(v[3]);
         if (!time || *time<cat.start-week_ms || *time>=cat.end) return;
         Index campaign=cat.campaign_index.get(keys.encode(v[2]),0);
         if (!campaign) return;
-        auto dest=canon.locate(keys.encode(v[1]));
-        result[worker][dest.bin].append({dest.person,{keys.encode(v[0]),*time,campaign}});
+        auto& batch=batches[worker];
+        size_t i=batch.count++;
+        Key person=keys.encode(v[1]);
+        batch.hashes[i]=mix(person);
+        canon.routes.prefetch(batch.hashes[i]);
+        batch.rows[i]={person,{keys.encode(v[0]),encode_click(*time,cat),campaign}};
+        if (batch.count==batch_size) flush(worker);
     });
+    for (size_t w=0;w<threads;++w) flush(w);
     return result;
 }
 
@@ -487,8 +504,8 @@ void user_days(const std::string& person,CampaignWindow& window,const std::vecto
         int32_t date=start/day_ms-(start%day_ms<0);
         if (day.sessions && day.day!=date) finish();
         if (!day.sessions) {day.day=date; day.category=std::numeric_limits<Index>::max();}
-        while (right<click_end && cs[right].time<=start) window.add(cs[right++].campaign);
-        while (left<right && cs[left].time<start-week_ms) {
+        while (right<click_end && click_time(cs[right].time,cat)<=start) window.add(cs[right++].campaign);
+        while (left<right && click_time(cs[left].time,cat)<start-week_ms) {
             window.remove(cs[left++].campaign);
         }
         Index credit=left==right ? 0 : cs[right-1].campaign;
@@ -632,7 +649,7 @@ void run(const fs::path& input,const fs::path& output,size_t threads,Keys& keys,
     auto raw=parse_events(input/"events",threads>1 ? threads-1 : 1,catalog,keys);
     auto canon=links.get();
     uint64_t physical_rows=0;
-    for (const auto& batch:raw) physical_rows+=batch.count;
+    for (const auto& batch:raw) for (const auto& bin:batch) physical_rows+=bin.count;
     progress("catalog, identities and event parse");
     auto events=deduplicate(raw,threads,canon);
     progress("event deduplication");
@@ -663,7 +680,7 @@ void run(const fs::path& input,const fs::path& output,size_t threads) {
     auto start=std::chrono::steady_clock::now();
     Keys keys;
     Catalog catalog(input,keys);
-    if (catalog.end>catalog.start && uint64_t(catalog.end-catalog.start)<=UINT32_MAX &&
+    if (catalog.end>catalog.start && uint64_t(catalog.end-catalog.start)<=UINT32_MAX-week_ms &&
         catalog.categories.size()<=256) {
         Engine<WindowValue>{}.run(input,output,threads,keys,catalog,start);
     } else {

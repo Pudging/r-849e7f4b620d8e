@@ -50,12 +50,34 @@ inline Masks classify(const char* bytes) {
             unsigned(_mm_movemask_epi8(quotes))};
 }
 
+// Complete rows have a fixed schema. Decode their boundaries together so
+// the compiler can specialize quote checks and views for each field.
+template<size_t N,class F,size_t... I>
+inline void emit_row(const char* row,const std::array<const char*,N>& cuts,F& emit,
+                     std::index_sequence<I...>) {
+    std::array<std::string_view,N> values;
+    unsigned invalid=0;
+    auto field=[&](auto index) {
+        constexpr size_t i=decltype(index)::value;
+        const char* first=i ? cuts[i-1]+1 : row;
+        const char* stop=cuts[i];
+        const size_t length=stop-first;
+        unsigned opens=*first=='"';
+        unsigned closes=length && stop[-1]=='"';
+        unsigned wrapped=opens & closes & unsigned(length>=2);
+        invalid|=(opens|closes)^wrapped;
+        values[i]={first+wrapped,length-2*wrapped};
+    };
+    (field(std::integral_constant<size_t,I>{}),...);
+    if (!invalid) emit(values);
+}
+
 template<size_t N, class F>
 void scan(const char* begin, const char* end, F&& emit) {
-    const char *row = begin, *field = begin, *p = begin;
+    const char *row = begin, *p = begin;
     size_t column = 0;
     bool suspect = false;
-    std::array<std::string_view, N> values;
+    std::array<const char*,N> cuts;
     for (; end - p >= 32; p += 32) {
         auto a = classify(p), b = classify(p + 16);
         uint32_t sep = a.separators | (b.separators << 16);
@@ -71,32 +93,19 @@ void scan(const char* begin, const char* end, F&& emit) {
             marks &= marks - 1;
             const char* cut = p + bit;
             if (*cut == '"') { suspect = true; continue; }
-            if (column < N) {
-                size_t len = cut - field;
-                // An empty field starts at its delimiter. Avoid a branch for
-                // every independently quoted value in the common valid case.
-                size_t opens = *field == '"';
-                bool closes = cut != begin && cut[-1] == '"';
-                if (opens != closes || len < 2 * opens) suspect = true;
-                if (len >= 2 * opens) values[column] = {field + opens, len - 2 * opens};
-                ++column;
-            } else {
-                suspect = true;
-            }
-            field = cut + 1;
-            if (*cut == '\n') {
-                if (suspect) {
-                    if (fields(std::string_view(row, cut - row), values)) emit(values);
-                } else if (column == N) {
-                    emit(values);
-                }
-                row = field;
+            if (column<N) cuts[column++]=cut;
+            else suspect=true;
+            if (*cut=='\n') {
+                if (!suspect && column==N)
+                    emit_row(row,cuts,emit,std::make_index_sequence<N>{});
+                row=cut+1;
                 column = 0;
                 suspect = false;
             }
         }
     }
     // The scalar parser handles each remaining complete or unterminated row.
+    std::array<std::string_view,N> values;
     while (row < end) {
         auto next = after_line(row, end);
         auto stop = next - (next[-1] == '\n');

@@ -140,6 +140,18 @@ public:
         auto& s=table[slot(k)];
         return s.k ? s.value : fallback;
     }
+    void prefetch(uint64_t hash) const {
+        if (!table.empty()) __builtin_prefetch(&table[(hash>>PartitionBits)&(table.size()-1)],0,1);
+    }
+    Key lookup_hashed(Key key,uint64_t hash) const {
+        if (table.empty()) return 0;
+        const auto mask=table.size()-1;
+        for (size_t i=(hash>>PartitionBits)&mask;;i=(i+1)&mask) {
+            const auto& cell=table[i];
+            if (cell.k==key) return cell.value;
+            if (!cell.k) return 0;
+        }
+    }
     void put(Key k, Key v) {
         if (!k) throw std::logic_error("empty dictionary key");
         if (table.empty() || (used+1)*10>table.size()*7) grow();
